@@ -13,8 +13,13 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
-from email.message import EmailMessage
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.policy import SMTP as MIME_POLICY  # RFC-compliant headers (UTF-8 subjects/names), CRLF line ends
 from email.utils import formataddr, formatdate, make_msgid
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pandas as pd
@@ -34,9 +39,17 @@ from config import (
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
 LINK_RE = re.compile(
-    r"(?P<url>https?://[^\s<>\"]+[^\s<>\".,;:!?)\]»'])"
+    r"(?P<url>(?:https?://|www\.)[^\s<>\"]+[^\s<>\".,;:!?)\]»'])"
     r"|(?P<email>[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})"
+    r"|(?P<phone>\+\d{10,15})(?!\d)"
 )
+# Placeholders in the letter bodies, filled in when sending: the blank "«____» ____________ 2026 р."
+# date line, and the address in the letter's recipient block ("E-mail: ..." under the addressee).
+DATE_TOKEN = "{{date}}"
+RECIPIENT_TOKEN = "{{recipient_email}}"
+BLANK_ADDRESS = "____________________"
+EN_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+             "September", "October", "November", "December"]
 MIN_DELAY_SECONDS = 5
 RETRY_BACKOFF_SECONDS = (30, 90)  # waits before 2nd and 3rd attempt on connection errors
 
@@ -203,7 +216,7 @@ def validate_row(row: dict) -> list[str]:
         problems.append(f"Invalid e-mail address: {', '.join(bad)}")
     if not (row.get("subject") or "").strip():
         problems.append("Empty subject")
-    if not (row.get("body") or "").strip():
+    if not (row.get("body") or "").strip() and not (row.get("body_html") or "").strip():
         problems.append("Empty body")
 
     raw = (row.get("attachment_filename") or "").strip()
@@ -219,28 +232,236 @@ def validate_row(row: dict) -> list[str]:
     return problems
 
 
-# --------------------------------------------------------------------------- message building
+# --------------------------------------------------------------------------- HTML <-> plain text
+
+DEFAULT_WRAPPER_STYLE = "font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;"
+# Tags whose default browser rendering has vertical margins (a blank line in plain text).
+_SPACED_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "ul", "ol", "table"}
+_BLOCK_TAGS = _SPACED_TAGS | {"div", "li", "tr", "section", "article", "header", "footer"}
+_SKIP_TAGS = {"head", "title", "style", "script"}
+_MARGIN_RE = re.compile(r"margin(?:-(top|bottom))?\s*:\s*([^;]+)", re.IGNORECASE)
+_NUMBER_RE = re.compile(r"-?\d*\.?\d+")
+
+
+def linkify(escaped: str) -> str:
+    """Make bare URLs, www. addresses, e-mail addresses and +phone numbers in escaped text clickable."""
+
+    def repl(match: re.Match) -> str:
+        if match.group("url"):
+            url = match.group("url")
+            href = url if "://" in url else f"http://{url}"
+            return f'<a href="{href}">{url}</a>'
+        if match.group("email"):
+            address = match.group("email")
+            return f'<a href="mailto:{address}">{address}</a>'
+        phone = match.group("phone")
+        return f'<a href="tel:{phone}">{phone}</a>'
+
+    return LINK_RE.sub(repl, escaped)
+
+
+def letter_date(lang: str, when: datetime | None = None) -> str:
+    """The date as written in the letters: "22.09.2026 р." (UA) or "22 September 2026" (EN)."""
+    when = when or datetime.now()
+    if lang == "en":
+        return f"{when.day} {EN_MONTHS[when.month - 1]} {when.year}"
+    return f"{when:%d.%m.%Y} р."
 
 
 def text_to_html(text: str) -> str:
-    """Plain text -> an HTML fragment: blank lines split paragraphs, links become clickable."""
-
-    def linkify(escaped: str) -> str:
-        def repl(match: re.Match) -> str:
-            if match.group("url"):
-                url = match.group("url")
-                return f'<a href="{url}">{url}</a>'
-            address = match.group("email")
-            return f'<a href="mailto:{address}">{address}</a>'
-
-        return LINK_RE.sub(repl, escaped)
-
+    """Plain text -> HTML fragment. Used for rows without body_html, or on request in the editor."""
     paragraphs = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
     body = "\n".join(
-        '<p style="margin:0 0 12px 0">' + linkify(html.escape(p, quote=False)).replace("\n", "<br>") + "</p>"
+        '<p style="margin:0 0 12px 0;">' + linkify(html.escape(p, quote=False)).replace("\n", "<br>") + "</p>"
         for p in paragraphs
     )
-    return f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#222">{body}</div>'
+    return f'<div style="{DEFAULT_WRAPPER_STYLE}">\n{body}\n</div>'
+
+
+def _vertical_margins(style: str, default: bool) -> tuple[bool, bool]:
+    """(has top margin, has bottom margin) according to an inline style."""
+    top = bottom = None
+    for side, value in _MARGIN_RE.findall(style or ""):
+        parts = value.split()
+        if not parts:
+            continue
+        if not side:
+            top, bottom = parts[0], parts[2] if len(parts) > 2 else parts[0]
+        elif side.lower() == "top":
+            top = parts[0]
+        else:
+            bottom = parts[0]
+
+    def positive(value: str | None) -> bool:
+        if value is None:
+            return default
+        number = _NUMBER_RE.match(value)
+        return bool(number) and float(number.group()) > 0
+
+    return positive(top), positive(bottom)
+
+
+class _TextExtractor(HTMLParser):
+    """HTML -> readable plain text.
+
+    Blocks with a vertical margin are separated by a blank line and blocks without
+    one by a single newline, which is how the Word spacing ends up in the fallback text.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.pending = 0  # newlines owed before the next text: 1 = line break, 2 = blank line
+        self.fresh = True  # at the start of a line: drop leading spaces
+        self.skip = 0
+        self.blocks: list[tuple[str, bool]] = []  # open blocks: (tag, has bottom margin)
+        self.lists: list[list] = []  # open lists: [ordered, next number]
+        self.links: list[tuple[str, int]] = []
+        self.cells = 0  # cells seen in the current table row
+        self.in_cell = 0  # inside a table cell, line breaks become spaces: "a | b" per row
+        self.cell_gap = False
+
+    def _break(self, lines: int) -> None:
+        if self.in_cell:
+            self.cell_gap = True
+        elif self.parts:
+            self.pending = max(self.pending, lines)
+        self.fresh = True
+
+    def _emit(self, text: str) -> None:
+        if self.pending:
+            self.parts.append("\n" * self.pending)
+            self.pending = 0
+        if self.cell_gap:
+            if self.parts and not self.parts[-1].endswith((" ", "\n")):
+                self.parts.append(" ")
+            self.cell_gap = False
+        self.parts.append(text)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in _SKIP_TAGS:
+            self.skip += 1
+        elif tag == "br":
+            if self.in_cell:
+                self._break(1)
+            else:
+                self._emit("\n")
+                self.fresh = True
+        elif tag == "a":
+            self.links.append((attrs.get("href") or "", len("".join(self.parts))))
+        elif tag in ("td", "th"):
+            if self.cells:
+                self._emit(" | ")
+            self.cells += 1
+            self.in_cell += 1
+            self.cell_gap = False
+            self.fresh = True
+        elif tag in _BLOCK_TAGS:
+            top, bottom = _vertical_margins(attrs.get("style", ""), default=tag in _SPACED_TAGS)
+            self._break(2 if top else 1)
+            self.blocks.append((tag, bottom))
+            if tag == "tr":
+                self.cells = 0
+            elif tag in ("ul", "ol"):
+                start = attrs.get("start") or "1"
+                self.lists.append([tag == "ol", int(start) if start.isdigit() else 1])
+            elif tag == "li":
+                ordered, number = self.lists[-1] if self.lists else (False, 1)
+                if self.lists:
+                    self.lists[-1][1] += 1
+                self._emit("   " * max(len(self.lists) - 1, 0) + (f"{number}. " if ordered else "• "))
+                self.fresh = True
+
+    def handle_endtag(self, tag):
+        if tag in _SKIP_TAGS:
+            self.skip = max(0, self.skip - 1)
+        elif tag in ("td", "th"):
+            self.in_cell = max(0, self.in_cell - 1)
+            self.cell_gap = False
+        elif tag == "a" and self.links:
+            href, start = self.links.pop()
+            label = "".join(self.parts)[start:]
+            target = re.sub(r"^(mailto:|tel:|https?://)", "", href, flags=re.IGNORECASE).rstrip("/")
+            if target and not href.startswith("#") and target not in label:
+                self._emit(f" ({href.removeprefix('mailto:').removeprefix('tel:')})")
+        elif tag in _BLOCK_TAGS:
+            for i in range(len(self.blocks) - 1, -1, -1):
+                if self.blocks[i][0] == tag:
+                    closed = self.blocks[i:]
+                    del self.blocks[i:]
+                    for name, _ in closed:
+                        if name in ("ul", "ol") and self.lists:
+                            self.lists.pop()
+                    self._break(2 if closed[0][1] else 1)
+                    break
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        text = re.sub(r"[ \t\r\n\f]+", " ", data)  # HTML whitespace; &nbsp; (\xa0) is kept
+        if self.fresh:
+            text = text.lstrip(" ")
+            if not text.strip():
+                return
+        if text:
+            self._emit(text)
+            self.fresh = False
+
+    def text(self) -> str:
+        out = "".join(self.parts).replace("\xa0", " ").replace(" ", "\t")
+        out = "\n".join(line.rstrip() for line in out.split("\n"))
+        return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def html_to_text(markup: str) -> str:
+    extractor = _TextExtractor()
+    extractor.feed(markup or "")
+    extractor.close()
+    return extractor.text()
+
+
+def stored_bodies(row: dict) -> tuple[str, str]:
+    """(plain text, HTML fragment) as stored, with placeholders; a missing one is derived from the other."""
+    text = (row.get("body") or "").replace("\r\n", "\n").strip()
+    fragment = (row.get("body_html") or "").strip()
+    if not fragment and text:
+        fragment = text_to_html(text)
+    if not text and fragment:
+        text = html_to_text(fragment)
+    return text, fragment
+
+
+def message_bodies(row: dict, when: datetime | None = None) -> tuple[str, str]:
+    """(plain text, HTML fragment) exactly as sent: {{date}} and {{recipient_email}} filled in."""
+    date = letter_date(row.get("lang", ""), when)
+    addresses = split_recipients(row.get("recipient_email", ""))
+    links = ", ".join(f'<a href="mailto:{html.escape(a)}">{html.escape(a)}</a>' for a in addresses)
+    text, fragment = stored_bodies(row)
+    text = text.replace(DATE_TOKEN, date).replace(RECIPIENT_TOKEN, ", ".join(addresses) or BLANK_ADDRESS)
+    fragment = fragment.replace(DATE_TOKEN, html.escape(date)).replace(RECIPIENT_TOKEN, links or BLANK_ADDRESS)
+    return text, fragment
+
+
+def html_document(fragment: str, title: str = "", lang: str = "") -> str:
+    """A complete, e-mail-safe HTML document: inline styles only, no <style> blocks or classes."""
+    lang_attr = {"ua": "uk", "en": "en"}.get(lang, "")
+    return (
+        "<!DOCTYPE html>\n"
+        + (f'<html lang="{lang_attr}">\n' if lang_attr else "<html>\n")
+        + "<head>\n"
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        '<meta name="x-apple-disable-message-reformatting">\n'
+        f"<title>{html.escape(title)}</title>\n"
+        "</head>\n"
+        '<body style="margin:0;padding:0;">\n'
+        f"{fragment}\n"
+        "</body>\n</html>\n"
+    )
+
+
+# --------------------------------------------------------------------------- message building
 
 
 def build_message(
@@ -248,29 +469,46 @@ def build_message(
     settings: config.SmtpSettings,
     to_override: str | None = None,
     subject_prefix: str = "",
-) -> EmailMessage:
-    msg = EmailMessage()
-    msg["Subject"] = f"{subject_prefix}{row['subject'].strip()}"
+) -> MIMEMultipart:
+    """multipart/alternative (plain + HTML), wrapped in multipart/mixed when there are attachments."""
+    text, fragment = message_bodies(row)
+    subject = " ".join(f"{subject_prefix}{row['subject']}".split())
+
+    body = MIMEMultipart("alternative", policy=MIME_POLICY)
+    # Plain text first: clients show the last alternative they can render.
+    body.attach(MIMEText(text + "\n", "plain", "utf-8", policy=MIME_POLICY))
+    body.attach(MIMEText(html_document(fragment, subject, row.get("lang", "")), "html", "utf-8", policy=MIME_POLICY))
+
+    files = []
+    for name in attachment_names(row):
+        path = resolve_attachment(name)
+        if path is None:
+            raise FileNotFoundError(f"Attachment not found in attachments/: {name}")
+        files.append(path)
+
+    if files:
+        msg = MIMEMultipart("mixed", policy=MIME_POLICY)
+        msg.attach(body)
+        for path in files:
+            ctype, encoding = mimetypes.guess_type(path.name)
+            if ctype is None or encoding is not None:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            part = MIMEBase(maintype, subtype, policy=MIME_POLICY)
+            part.set_payload(path.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=path.name)
+            msg.attach(part)
+    else:
+        msg = body
+
+    msg["Subject"] = subject
     msg["From"] = formataddr((settings.sender_name, settings.sender_email)) if settings.sender_name else settings.sender_email
     msg["To"] = ", ".join(split_recipients(to_override or row["recipient_email"]))
     if settings.reply_to:
         msg["Reply-To"] = settings.reply_to
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=settings.sender_email.rpartition("@")[2] or None)
-
-    body = row["body"].replace("\r\n", "\n").strip() + "\n"
-    msg.set_content(body)
-    msg.add_alternative(f"<!DOCTYPE html><html><body>{text_to_html(body)}</body></html>", subtype="html")
-
-    for name in attachment_names(row):
-        path = resolve_attachment(name)
-        if path is None:
-            raise FileNotFoundError(f"Attachment not found in attachments/: {name}")
-        ctype, encoding = mimetypes.guess_type(path.name)
-        if ctype is None or encoding is not None:
-            ctype = "application/octet-stream"
-        maintype, subtype = ctype.split("/", 1)
-        msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
     return msg
 
 
@@ -279,7 +517,7 @@ def send_row(row: dict, settings: config.SmtpSettings, to_override: str | None =
     msg = build_message(row, settings, to_override, subject_prefix)
     with config.open_smtp(settings) as smtp:
         smtp.send_message(msg)
-    return msg["To"]
+    return str(msg["To"])
 
 
 def classify_error(exc: BaseException) -> str:

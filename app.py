@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pandas as pd
 import streamlit as st
 
-import config
-import parser as docx_parser
-from config import (
+LOCAL_MODULES = ("config", "sender", "parser")
+
+
+def _drop_stale_local_modules() -> None:
+    """Make sure the imports below see the current config.py / sender.py / parser.py.
+
+    Streamlit only reloads local modules it already watches, and it refreshes that list only after
+    a successful run. An edit made while the app is running can therefore leave an outdated copy in
+    sys.modules ("cannot import name 'html_to_text' from 'sender'") until the server restarts.
+    Every local module is stamped with its file's mtime when loaded (below); if any file changed
+    since, all of them are dropped together, because they import from each other.
+    """
+    for name in LOCAL_MODULES:
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "__loaded_mtime__", None) != os.path.getmtime(module.__file__):
+            for stale in LOCAL_MODULES:
+                sys.modules.pop(stale, None)
+            return
+
+
+_drop_stale_local_modules()
+
+import config  # noqa: E402
+import parser as docx_parser  # noqa: E402
+from config import (  # noqa: E402
     ATTACHMENTS_DIR,
     DEFAULT_ATTACHMENTS,
     LANGS,
@@ -18,23 +43,34 @@ from config import (
     STATUS_SENT,
     STATUSES,
 )
-from sender import (
+from sender import (  # noqa: E402
+    DATE_TOKEN,
+    RECIPIENT_TOKEN,
     Dispatcher,
     QueueLockedError,
     SendSettings,
     State,
     attachment_names,
+    html_to_text,
+    message_bodies,
     now_str,
     queue_store,
     resolve_attachment,
     split_recipients,
+    stored_bodies,
     text_to_html,
     validate_row,
 )
 
+for _name in LOCAL_MODULES:
+    _module = sys.modules[_name]
+    _module.__dict__.setdefault("__loaded_mtime__", os.path.getmtime(_module.__file__))
+
 st.set_page_config(page_title="Email Dispatcher", page_icon="✉️", layout="wide")
 
-EDITABLE_COLUMNS = ["organization", "recipient_email", "subject", "body", "lang", "attachment_filename", "status"]
+# Letter bodies are edited in the Letter editor tab, where HTML and plain text stay in sync.
+EDITABLE_COLUMNS = ["organization", "recipient_email", "subject", "lang", "attachment_filename", "status"]
+BODY_VIEWS = ["👁️ HTML view", "</> HTML source", "📝 Plain text"]
 EDITOR_COLUMN_ORDER = [
     "id", "status", "organization", "recipient_email", "subject", "lang",
     "attachment_filename", "body", "error_message", "sent_at",
@@ -44,9 +80,27 @@ STATUS_ICONS = {STATUS_PENDING: "🕓", STATUS_SENT: "✅", STATUS_ERROR: "❌"}
 
 
 @st.cache_resource
+def _server_state() -> dict:
+    """Server-wide state that survives reruns and module reloads."""
+    return {}
+
+
 def get_dispatcher() -> Dispatcher:
-    """One worker per Streamlit server, shared by all browser tabs and reruns."""
-    return Dispatcher(queue_store)
+    """One worker per Streamlit server, shared by all browser tabs and reruns.
+
+    After sender.py is reloaded the worker is rebuilt from the new code, but never while a run is
+    in progress, so there is only ever one sending thread.
+    """
+    state = _server_state()
+    current = state.get("dispatcher")
+    if current is None or (not isinstance(current, Dispatcher) and not current.is_active):
+        fresh = Dispatcher(queue_store)
+        if current is not None:
+            fresh.log.extend(current.log)
+            fresh.smtp_status, fresh.last_result = current.smtp_status, current.last_result
+            fresh.next_send_at = current.next_send_at  # keep the anti-spam delay
+        state["dispatcher"] = fresh
+    return state["dispatcher"]
 
 
 dispatcher = get_dispatcher()
@@ -195,9 +249,28 @@ def reset_errors() -> None:
     reset_editor()
 
 
+def preview(fragment: str) -> None:
+    """Render an e-mail body the way a mail client would: dark text on white, whatever the app theme."""
+    st.html(f'<div style="background:#ffffff;color:#000000;padding:20px 24px;border-radius:6px;">{fragment}</div>')
+
+
+def save_letter(letter_id: int, previous_status: str, fields: dict) -> None:
+    if fields.get("status") == STATUS_PENDING and previous_status != STATUS_PENDING:
+        fields.update(error_message="", sent_at="")
+    try:
+        queue_store.update_row(letter_id, **fields)
+    except QueueLockedError as exc:
+        st.error(str(exc))
+        return
+    ss.letter_version += 1
+    flash("success", f"Letter #{letter_id} saved.")
+    st.rerun()
+
+
 def run_import(keep_sent: bool) -> None:
     try:
-        summary = docx_parser.import_docx(keep_sent=keep_sent)
+        with st.spinner(f"Parsing {config.DOCX_PATH.name}…"):
+            summary = docx_parser.import_docx(keep_sent=keep_sent)
     except Exception as exc:  # noqa: BLE001 - show parse problems in the UI
         flash("error", f"Import failed: {exc}")
         return
@@ -292,6 +365,11 @@ st.caption(
 
 if message := ss.pop("flash", None):
     getattr(st, message[0])(message[1])
+if not isinstance(dispatcher, Dispatcher):
+    st.warning(
+        "The app's code was updated while sending. This run continues with the previous version; "
+        "the new version takes over when it finishes or you press Stop."
+    )
 
 banner, test_col = st.columns([5, 1], vertical_alignment="center")
 with test_col:
@@ -448,7 +526,7 @@ with tab_queue:
             height=520,
             num_rows="dynamic",
             column_order=EDITOR_COLUMN_ORDER,
-            disabled=["id", "error_message", "sent_at"],
+            disabled=["id", "body", "error_message", "sent_at"],
             column_config={
                 "id": st.column_config.NumberColumn("ID", width="small"),
                 "status": st.column_config.SelectboxColumn("Status", options=STATUSES, required=True, width="small"),
@@ -462,7 +540,9 @@ with tab_queue:
                     "Attachment", options=options, width="medium",
                     help=f"File in attachments/. Empty = default for the language, '{NO_ATTACHMENT}' = no attachment.",
                 ),
-                "body": st.column_config.TextColumn("Body", width="large", help="Long texts are easier to edit in the Letter editor tab."),
+                "body": st.column_config.TextColumn(
+                    "Body (plain text)", width="large", help="Edit letter bodies (HTML and plain text) in the Letter editor tab."
+                ),
                 "error_message": st.column_config.TextColumn("Error", width="medium"),
                 "sent_at": st.column_config.TextColumn("Sent at", width="small"),
             },
@@ -491,10 +571,13 @@ with tab_letter:
             ss["letter_id"] = first_pending
         letter_id = st.selectbox("Letter", ids, key="letter_id", format_func=label_for)
         row = queue[queue["id"] == letter_id].iloc[0].to_dict()
-        left, right = st.columns(2, gap="large")
+        text, fragment = message_bodies(row)  # as sent: {{date}} filled in
+        stored_text, stored_html = stored_bodies(row)  # as saved: what the editors show
+        version = f"{letter_id}_{ss.letter_version}"  # fresh widgets after every save
+        details, summary = st.columns([3, 2], gap="large")
 
-        with left:
-            with st.form(f"letter_{letter_id}_{ss.letter_version}"):
+        with details:
+            with st.form(f"letter_{version}"):
                 recipient = st.text_input("Recipient e-mail", row["recipient_email"], help="Several addresses: separate with commas.")
                 subject = st.text_input("Subject", row["subject"])
                 f1, f2, f3 = st.columns([1, 2, 1])
@@ -504,31 +587,17 @@ with tab_letter:
                     help=f"File name(s) in attachments/, separated by ';'. Empty = default for the language, '{NO_ATTACHMENT}' = no attachment.",
                 )
                 status = f3.selectbox("Status", STATUSES, index=STATUSES.index(row["status"]))
-                body = st.text_area("Body", row["body"], height=460)
-                submitted = st.form_submit_button("💾 Save letter", type="primary", disabled=locked)
-            if locked:
-                st.caption("Pause the dispatcher to edit letters.")
+                submitted = st.form_submit_button("💾 Save details", type="primary", disabled=locked)
             if submitted:
-                fields = {
+                save_letter(letter_id, row["status"], {
                     "recipient_email": recipient.strip(),
                     "subject": " ".join(subject.split()),
                     "lang": lang,
                     "attachment_filename": attachment.strip(),
                     "status": status,
-                    "body": body.replace("\r\n", "\n").strip(),
-                }
-                if status == STATUS_PENDING and row["status"] != STATUS_PENDING:
-                    fields.update(error_message="", sent_at="")
-                try:
-                    queue_store.update_row(letter_id, **fields)
-                except QueueLockedError as exc:
-                    st.error(str(exc))
-                else:
-                    ss.letter_version += 1
-                    flash("success", f"Letter #{letter_id} saved.")
-                    st.rerun()
+                })
 
-        with right:
+        with summary:
             problems = validate_row(row)
             if row["status"] == STATUS_SENT:
                 st.success(f"Sent {row['sent_at']}")
@@ -547,10 +616,64 @@ with tab_letter:
                 f"**From:** {smtp.sender_name + ' ' if smtp.sender_name else ''}&lt;{smtp.sender_email or '?'}&gt;  \n"
                 f"**To:** {', '.join(split_recipients(row['recipient_email'])) or '—'}  \n"
                 f"**Subject:** {row['subject'] or '—'}  \n"
-                f"**Attachments:** {', '.join(attachment_info) or 'none'}"
+                f"**Attachments:** {', '.join(attachment_info) or 'none'}  \n"
+                f"**Body:** HTML {len(fragment.encode('utf-8')) / 1024:,.1f} KB"
+                + ("" if row["body_html"] else " (generated from the plain text)")
+                + f" + plain-text fallback ({len(text):,} characters)"
             )
-            with st.container(border=True, height=520):
-                st.html(f'<div style="background:#fff;padding:16px;border-radius:6px">{text_to_html(row["body"])}</div>')
+        if locked:
+            st.caption("Pause the dispatcher to edit letters.")
+
+        view = st.segmented_control("Body", BODY_VIEWS, default=BODY_VIEWS[0], key="body_view") or BODY_VIEWS[0]
+        if view == BODY_VIEWS[0]:
+            with st.container(border=True, height=640):
+                preview(fragment)
+            st.caption(
+                "What recipients see in Gmail, Ukr.net, Outlook or Apple Mail. "
+                "Mail clients that can't display HTML show the plain-text version instead."
+                + (f" `{DATE_TOKEN}` shows today's date here and is filled with the sending date;" if DATE_TOKEN in stored_html else "")
+                + (f" `{RECIPIENT_TOKEN}` shows the Recipient e-mail above." if RECIPIENT_TOKEN in stored_html else "")
+            )
+
+        elif view == BODY_VIEWS[1]:
+            source_col, live_col = st.columns(2, gap="medium")
+            with source_col:
+                source = st.text_area(
+                    "HTML source", stored_html, height=600, key=f"html_{version}",
+                    help=f"{DATE_TOKEN} becomes the sending date, {RECIPIENT_TOKEN} the letter's recipient e-mail.",
+                )
+                sync = st.checkbox("Regenerate the plain-text version from this HTML", value=True, key=f"sync_{version}")
+                if st.button("💾 Save HTML", type="primary", disabled=locked, key=f"save_html_{version}"):
+                    if source.strip() == stored_html and not sync:
+                        st.toast("No changes to save.")
+                    else:
+                        fields = {"body_html": source.strip()}
+                        if sync:
+                            fields["body"] = html_to_text(source)
+                        save_letter(letter_id, row["status"], fields)
+            with live_col:
+                st.caption("Preview of the source on the left (updates when you click outside the editor or press Ctrl+Enter).")
+                with st.container(border=True, height=600):
+                    preview(message_bodies({**row, "body_html": source})[1])
+
+        else:
+            plain = st.text_area("Plain-text version", stored_text, height=560, key=f"text_{version}")
+            rebuild = st.checkbox(
+                "Also rebuild the HTML from this text (the Word formatting is lost)", value=False, key=f"rebuild_{version}"
+            )
+            st.caption(
+                "Shown only by mail clients that don't display HTML; most recipients see the HTML version. "
+                "To change what they see, edit the HTML source."
+            )
+            if st.button("💾 Save plain text", type="primary", disabled=locked, key=f"save_text_{version}"):
+                plain = plain.replace("\r\n", "\n").strip()
+                if plain == stored_text and not rebuild:
+                    st.toast("No changes to save.")
+                else:
+                    fields = {"body": plain}
+                    if rebuild:
+                        fields["body_html"] = text_to_html(plain)
+                    save_letter(letter_id, row["status"], fields)
 
 with tab_check:
     pending_rows = queue[queue["status"] == STATUS_PENDING]

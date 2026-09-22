@@ -25,7 +25,8 @@ QUEUE_COLUMNS = [
     "organization",
     "recipient_email",
     "subject",
-    "body",
+    "body",  # plain-text version (fallback part of the e-mail)
+    "body_html",  # HTML version with the Word formatting (what most clients show)
     "lang",
     "attachment_filename",
     "status",
