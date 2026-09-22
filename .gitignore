@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Runtime data (generated from emails.docx / written while sending)
+data/queue.csv
+data/queue.backup.csv
+data/*.tmp
+data/activity.log
+data/emails.backup.docx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+desktop.ini
+Thumbs.db
+.DS_Store
