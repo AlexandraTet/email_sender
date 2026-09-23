@@ -1,7 +1,5 @@
 """Queue storage, message building and the background dispatch worker."""
 
-from __future__ import annotations
-
 import html
 import mimetypes
 import os
@@ -11,8 +9,10 @@ import smtplib
 import threading
 import time
 from collections import Counter, deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from datetime import time as clock_time
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -176,7 +176,9 @@ def normalize_queue(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-queue_store = QueueStore(config.QUEUE_CSV)
+# One store per campaign; they are separate files, so the campaigns never touch each other.
+stores = {key: QueueStore(campaign.queue_csv) for key, campaign in config.CAMPAIGNS.items()}
+queue_store = stores[config.DEFAULT_CAMPAIGN]  # what parser.py writes when run from the command line
 
 
 # --------------------------------------------------------------------------- validation
@@ -559,19 +561,39 @@ class SendSettings:
         return max(MIN_DELAY_SECONDS, self.interval_seconds - high), max(MIN_DELAY_SECONDS, self.interval_seconds + high)
 
 
+def active_campaign() -> str:
+    """Name of the campaign sending right now, or "" - only one may send at a time."""
+    running = Dispatcher._active
+    return running.name if running is not None and running.is_active else ""
+
+
+def next_occurrence(at: clock_time, now: datetime | None = None) -> datetime:
+    """The next time the clock shows `at`: today if that is still ahead, otherwise tomorrow.
+
+    Setting 10:00 at 22:00 therefore means tomorrow morning, never "right now".
+    """
+    now = now or datetime.now()
+    target = datetime.combine(now.date(), at)
+    return target if target > now else target + timedelta(days=1)
+
+
 class State:
     IDLE = "idle"
+    SCHEDULED = "scheduled"  # counting down to a scheduled start
     SENDING = "sending"
-    WAITING = "waiting"
+    WAITING = "waiting"  # between e-mails
     PAUSED = "paused"
     STOPPING = "stopping"
 
 
 class Dispatcher:
-    """Owns the background worker thread. One instance per Streamlit server."""
+    """Owns the background worker thread. One instance per campaign per Streamlit server."""
 
-    def __init__(self, store: QueueStore):
+    _active: "Dispatcher | None" = None  # the campaign currently sending; only one at a time
+
+    def __init__(self, store: QueueStore, name: str = ""):
         self.store = store
+        self.name = name
         self.settings = SendSettings()
         self.log: deque[tuple[str, str, str]] = deque(maxlen=500)
         self.smtp_status: tuple[bool, str, str] | None = None  # (ok, message, checked_at)
@@ -585,6 +607,7 @@ class Dispatcher:
         self.state = State.IDLE
         self.current: str = ""
         self.next_send_at: float = 0.0  # epoch seconds; survives Stop/Start so the delay is always honoured
+        self.scheduled_for: float = 0.0  # epoch seconds of a pending scheduled start, 0 = none
         self.last_result: str = ""
         self.run_sent = 0
         self.run_errors = 0
@@ -595,7 +618,8 @@ class Dispatcher:
     def is_active(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self) -> str:
+    def start(self, start_at: datetime | None = None) -> str:
+        """Start a run now, or at `start_at` (local time) if that is in the future. Resumes if paused."""
         with self._lock:
             if self.is_active:
                 if self._pause.is_set():
@@ -605,16 +629,29 @@ class Dispatcher:
                 if self._stop.is_set():
                     return "Still stopping; try again in a moment."
                 return "Already running."
+            busy = Dispatcher._active
+            if busy is not None and busy is not self and busy.is_active:
+                return f"'{busy.name or 'another campaign'}' is still sending; stop it first."
             if not self.store.counts()[STATUS_PENDING]:
                 return "Nothing to send: no rows with status 'pending'."
             self._stop.clear()
             self._pause.clear()
             self.run_sent = self.run_errors = 0
             self.last_result = ""
-            self.state = State.SENDING
-            self._thread = threading.Thread(target=self._run, name="email-dispatcher", daemon=True)
+            scheduled = start_at is not None and start_at.timestamp() > time.time()
+            self.scheduled_for = start_at.timestamp() if scheduled else 0.0
+            self.state = State.SCHEDULED if scheduled else State.SENDING
+            Dispatcher._active = self
+            self._thread = threading.Thread(target=self._run, name=f"dispatcher-{self.name or 'queue'}", daemon=True)
             self._thread.start()
-            return "Started."
+            return f"Scheduled: sending starts at {start_at:%H:%M} on {start_at:%d.%m.%Y}." if scheduled else "Started."
+
+    def start_now(self) -> None:
+        """Skip the rest of a scheduled start's countdown."""
+        if self.is_active and self.scheduled_for:
+            self.scheduled_for = time.time()
+            self._pause.clear()
+            self._log("info", "Starting now instead of at the scheduled time.")
 
     def pause(self) -> None:
         if self.is_active and not self._pause.is_set():
@@ -638,6 +675,8 @@ class Dispatcher:
             "paused": self._pause.is_set(),
             "current": self.current,
             "seconds_to_next": max(0.0, self.next_send_at - time.time()),
+            "scheduled_for": self.scheduled_for,
+            "seconds_to_start": max(0.0, self.scheduled_for - time.time()) if self.scheduled_for else 0.0,
             "last_result": self.last_result,
             "run_sent": self.run_sent,
             "run_errors": self.run_errors,
@@ -673,9 +712,16 @@ class Dispatcher:
     # ---- worker
 
     def _run(self) -> None:
-        self._log("info", "Dispatch started.")
         result = "Finished: no pending rows left."
         try:
+            if self.scheduled_for:
+                self._log("info", f"Scheduled start: sending begins at {datetime.fromtimestamp(self.scheduled_for):%d.%m.%Y %H:%M}.")
+                # Re-read the deadline every tick so "Start now" can move it.
+                if not self._wait_until(lambda: self.scheduled_for, State.SCHEDULED):
+                    result = "Scheduled start cancelled."
+                    return
+                self.scheduled_for = 0.0
+            self._log("info", "Dispatch started.")
             while self.store.next_pending() is not None:
                 if not self._wait_until(self.next_send_at):
                     result = "Stopped by user."
@@ -710,8 +756,11 @@ class Dispatcher:
             result = f"Worker crashed: {type(exc).__name__}: {exc}"
             self._log("error", result)
         finally:
+            if Dispatcher._active is self:
+                Dispatcher._active = None
             self.state = State.IDLE
             self.current = ""
+            self.scheduled_for = 0.0
             self.last_result = result
             self._pause.clear()
             self._log("info", f"{result} This run: {self.run_sent} sent, {self.run_errors} errors.")
@@ -752,17 +801,22 @@ class Dispatcher:
                 self.current = ""
         return "halt", "Halted."
 
-    def _wait_until(self, deadline: float) -> bool:
-        """Sleep until `deadline`, honouring pause. Returns False if stopped."""
+    def _wait_until(self, deadline: float | Callable[[], float], state: str = State.WAITING) -> bool:
+        """Sleep until `deadline` (epoch seconds, or a function returning it), honouring pause.
+
+        While paused the clock keeps running, but nothing proceeds until Resume, even if the
+        deadline has passed in the meantime. Returns False if stopped.
+        """
+        get_deadline = deadline if callable(deadline) else (lambda: deadline)
         while not self._stop.is_set():
             if self._pause.is_set():
                 self.state = State.PAUSED
                 self._stop.wait(0.5)
                 continue
-            remaining = deadline - time.time()
+            remaining = get_deadline() - time.time()
             if remaining <= 0:
                 return True
-            self.state = State.WAITING
+            self.state = state
             self._stop.wait(min(0.5, remaining))
         return False
 
@@ -776,7 +830,7 @@ class Dispatcher:
             self.log.appendleft((stamp, level, message))
             try:
                 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-                with LOG_FILE.open("a", encoding="utf-8") as fh:
-                    fh.write(f"{stamp}  {level.upper():<7}  {message}\n")
+                with LOG_FILE.open("a", encoding="utf-8") as fh:  # shared by all campaigns
+                    fh.write(f"{stamp}  {level.upper():<7}  {f'[{self.name}] ' if self.name else ''}{message}\n")
             except OSError:
                 pass

@@ -1,7 +1,5 @@
 """Project paths, .env configuration and SMTP connection handling."""
 
-from __future__ import annotations
-
 import os
 import smtplib
 import socket
@@ -13,11 +11,8 @@ from dotenv import dotenv_values
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
-DOCX_PATH = BASE_DIR / "emails.docx"
 ATTACHMENTS_DIR = BASE_DIR / "attachments"
 DATA_DIR = BASE_DIR / "data"
-QUEUE_CSV = DATA_DIR / "queue.csv"
-QUEUE_BACKUP_CSV = DATA_DIR / "queue.backup.csv"
 LOG_FILE = DATA_DIR / "activity.log"
 
 QUEUE_COLUMNS = [
@@ -44,6 +39,51 @@ DEFAULT_ATTACHMENTS = {
 }
 # Put this in attachment_filename to send a letter without any attachment.
 NO_ATTACHMENT = "none"
+
+
+@dataclass(frozen=True)
+class Campaign:
+    """One mailing: its own source document, queue file and default attachments.
+
+    Campaigns are independent - separate queues, separate statuses - but only one of them
+    sends at a time (Dispatcher enforces that).
+    """
+
+    key: str
+    label: str
+    docx: Path
+    queue_csv: Path
+    attachments: dict  # language -> attachment file name in attachments/
+    date_mode: str = "blank"  # "blank": only fill an empty «____» date; "always": also a written one
+
+    @property
+    def backup_csv(self) -> Path:
+        return self.queue_csv.with_name(self.queue_csv.stem + ".backup.csv")
+
+
+CAMPAIGNS = {
+    "sponsors": Campaign(
+        key="sponsors",
+        label="Sponsors (emails.docx)",
+        docx=BASE_DIR / "emails.docx",
+        queue_csv=DATA_DIR / "queue.csv",
+        attachments=DEFAULT_ATTACHMENTS,
+    ),
+    "bloggers": Campaign(
+        key="bloggers",
+        label="Bloggers / creators (blogers_emails.docx)",
+        docx=BASE_DIR / "blogers_emails.docx",
+        queue_csv=DATA_DIR / "bloggers_queue.csv",
+        # The English price list: the same cost estimate the English sponsor letters carry.
+        attachments={"en": "expense_estimate_en.pdf", "ua": "expense_estimate_ua.pdf"},
+        date_mode="always",  # the letters carry a written date; keep it current when sending
+    ),
+}
+DEFAULT_CAMPAIGN = "sponsors"
+# Kept for the standalone scripts (parser.py, fix_typos.py), which work on the sponsor letters.
+DOCX_PATH = CAMPAIGNS[DEFAULT_CAMPAIGN].docx
+QUEUE_CSV = CAMPAIGNS[DEFAULT_CAMPAIGN].queue_csv
+QUEUE_BACKUP_CSV = CAMPAIGNS[DEFAULT_CAMPAIGN].backup_csv
 
 SECURITY_MODES = ("ssl", "starttls", "none")
 REQUIRED_ENV = ("SMTP_SERVER", "SMTP_PORT", "SENDER_EMAIL", "SENDER_PASSWORD")

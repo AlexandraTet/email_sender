@@ -21,13 +21,12 @@ spacing, borders, line breaks, bulleted/numbered lists and simple tables. The pl
 
 An explicit attachment can be named anywhere in a letter with a line such as
 "Attachment: brochure_en.pdf" (or "Вкладення:", "Додаток:", "Файл:"). Otherwise the
-attachment defaults to config.DEFAULT_ATTACHMENTS[lang].
+attachment defaults to the campaign's attachment for that language (config.CAMPAIGNS).
 
-Run standalone:  python parser.py            (re-import, keep 'sent' history)
-                 python parser.py --fresh    (re-import, everything back to pending)
+Run standalone:  python parser.py                        (sponsors, keep 'sent' history)
+                 python parser.py --campaign bloggers    (the blogger/creator letters)
+                 python parser.py --fresh                (re-import, everything back to pending)
 """
-
-from __future__ import annotations
 
 import argparse
 import html
@@ -46,14 +45,12 @@ from docx.oxml.ns import qn
 import config
 from config import (
     ATTACHMENTS_DIR,
-    DEFAULT_ATTACHMENTS,
-    QUEUE_BACKUP_CSV,
     QUEUE_COLUMNS,
     STATUS_ERROR,
     STATUS_PENDING,
     STATUS_SENT,
 )
-from sender import DATE_TOKEN, RECIPIENT_TOKEN, html_to_text, linkify, queue_store
+from sender import DATE_TOKEN, RECIPIENT_TOKEN, html_to_text, linkify, stores
 
 LETTERHEADS = {
     "NATIONAL TECHNICAL UNIVERSITY OF UKRAINE": "en",
@@ -67,6 +64,17 @@ TOC_RE = re.compile(r"^\s*(\d+)\.\s+(.+?)\s*(?:\[(ENG|EN|UKR|UA)\])?\s*$", re.IG
 DATE_LINE_RE = re.compile(r"(?:«.*»|\d{1,2}\.\d{1,2}\.)\s*.*20\d\d")
 # The unfilled date "«____» ____________ 2026 р." -> DATE_TOKEN, replaced by the sending date.
 BLANK_DATE_RE = re.compile(r"«\s*_+\s*»\s*_+\s*20\d\d(?:\s*р\.)?")
+# A date already written in the letter ("23 September 2026", "18.09.2026 р."); campaigns with
+# date_mode="always" replace it too, so letters are never sent with a stale date.
+WRITTEN_DATE_RE = re.compile(
+    r"\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d\d"
+    r"|\d{1,2}\.\d{1,2}\.20\d\d(?:\s*р\.)?",
+    re.IGNORECASE,
+)
+# "Subject: ..." / "Тема: ..." in front of the subject line (the blogger letters write it out).
+SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:subject|тема)\s*:\s*", re.IGNORECASE)
+# Contents entries like "1. MrBallen  -  info@ballenstudios.com": the address is not part of the name.
+TOC_CONTACT_RE = re.compile(r"\s*[-–—]\s*(\S+@\S+)\s*$")
 # The address(es) or blank in the recipient block's "E-mail:" paragraph (as rendered HTML).
 RECIPIENT_VALUE_RE = re.compile(r'<a href="mailto:[^"]*">[^<]*</a>(?:\s*[,;]\s*<a href="mailto:[^"]*">[^<]*</a>)*|_{3,}')
 PHONE_LINE_RE = re.compile(r"^\s*(?:тел|tel|phone)", re.IGNORECASE)
@@ -619,6 +627,24 @@ def _recipient_placeholder(body_html: str) -> str:
     return "\n".join(lines)
 
 
+def _date_placeholder(body_html: str, mode: str) -> str:
+    """Swap the letter's date line for DATE_TOKEN, so sending fills in the date of the day.
+
+    Always for a blank "«____» ____________ 2026"; for a written date only when the campaign asks
+    (date_mode="always"), otherwise a date typed into the document is left exactly as it is.
+    """
+    patterns = [BLANK_DATE_RE] + ([WRITTEN_DATE_RE] if mode == "always" else [])
+    lines = body_html.split("\n")
+    for i, line in enumerate(lines[:16]):  # the date sits just under the letterhead
+        if not line.startswith("<p"):
+            continue
+        for pattern in patterns:
+            if pattern.search(line):
+                lines[i] = pattern.sub(DATE_TOKEN, line, count=1)
+                return "\n".join(lines)
+    return body_html
+
+
 def _paragraph_text(p) -> str:
     """Paragraph text for layout detection (tabs/breaks as whitespace, deleted text excluded)."""
     parts = []
@@ -667,8 +693,11 @@ def _find_attachment(lines: dict[int, str]) -> tuple[str, set[int]]:
     return "; ".join(dict.fromkeys(found)), used
 
 
-def parse_docx(path: Path = config.DOCX_PATH) -> pd.DataFrame:
-    document = docx.Document(str(path))
+def parse_docx(campaign: config.Campaign | str | Path | None = None, path: Path | None = None) -> pd.DataFrame:
+    if isinstance(campaign, (str, Path)):  # parse_docx("some_letters.docx") still works
+        campaign, path = None, Path(campaign)
+    campaign = campaign or config.CAMPAIGNS[config.DEFAULT_CAMPAIGN]
+    document = docx.Document(str(path or campaign.docx))
     converter = DocxHtmlConverter(document)
     blocks = list(document.element.body.iterchildren(P_TAG, TBL_TAG))
     texts = [_paragraph_text(el) if el.tag == P_TAG else "" for el in blocks]
@@ -700,13 +729,18 @@ def parse_docx(path: Path = config.DOCX_PATH) -> pd.DataFrame:
         # subject line, salutation, body, signatures and contacts.
         attachment, attachment_lines = _find_attachment({i: texts[i] for i in range(subject_idx + 1, end) if texts[i]})
         body_html = converter.letter([blocks[i] for i in range(start, end) if i not in attachment_lines])
-        body_html = _recipient_placeholder(BLANK_DATE_RE.sub(DATE_TOKEN, body_html, count=1))
+        body_html = _recipient_placeholder(_date_placeholder(body_html, campaign.date_mode))
         body = html_to_text(body_html)
 
         toc_match = toc[n] if len(toc) == len(starts) else None
+        toc_name, toc_address = toc_match.group(2).strip() if toc_match else "", ""
+        if contact := TOC_CONTACT_RE.search(toc_name):  # "MrBallen  -  info@ballenstudios.com"
+            toc_name, toc_address = toc_name[: contact.start()].strip(), contact.group(1)
+        if not addresses and toc_address:
+            addresses = [toc_address]
         lang = _detect_lang(LETTERHEADS.get(texts[start]), toc_match and toc_match.group(3), texts[subject_idx] + body[:500])
-        if toc_match:
-            organization = toc_match.group(2).strip()
+        if toc_name:
+            organization = toc_name
         else:
             organization = ADDRESSEE_PREFIXES.sub("", addressee[0]).strip("«» ") if addressee else ""
 
@@ -715,11 +749,11 @@ def parse_docx(path: Path = config.DOCX_PATH) -> pd.DataFrame:
                 "id": n + 1,
                 "organization": organization,
                 "recipient_email": ", ".join(dict.fromkeys(addresses)),
-                "subject": " ".join(texts[subject_idx].split()),
+                "subject": SUBJECT_PREFIX_RE.sub("", " ".join(texts[subject_idx].split())),
                 "body": body,
                 "body_html": body_html,
                 "lang": lang,
-                "attachment_filename": attachment or DEFAULT_ATTACHMENTS.get(lang, ""),
+                "attachment_filename": attachment or campaign.attachments.get(lang, ""),
                 "status": STATUS_PENDING if addresses else STATUS_ERROR,
                 "error_message": "" if addresses else MISSING_EMAIL_MESSAGE,
                 "sent_at": "",
@@ -759,16 +793,20 @@ def carry_over_sent(new: pd.DataFrame, old: pd.DataFrame) -> tuple[pd.DataFrame,
     return new, kept
 
 
-def import_docx(docx_path: Path = config.DOCX_PATH, keep_sent: bool = True) -> dict:
-    """Parse the .docx and (re)write the queue. Returns a summary for the UI."""
-    new = parse_docx(docx_path)
+def import_docx(campaign: config.Campaign | None = None, keep_sent: bool = True,
+                docx_path: Path | None = None) -> dict:
+    """Parse a campaign's .docx and (re)write its queue. Returns a summary for the UI."""
+    campaign = campaign or config.CAMPAIGNS[config.DEFAULT_CAMPAIGN]
+    store = stores[campaign.key]
+    new = parse_docx(campaign, docx_path)
     kept = 0
-    if queue_store.exists():
-        shutil.copyfile(queue_store.path, QUEUE_BACKUP_CSV)
+    if store.exists():
+        shutil.copyfile(store.path, campaign.backup_csv)
         if keep_sent:
-            new, kept = carry_over_sent(new, queue_store.load())
-    queue_store.save(new)
+            new, kept = carry_over_sent(new, store.load())
+    store.save(new)
     return {
+        "campaign": campaign.key,
         "total": len(new),
         "ua": int((new["lang"] == "ua").sum()),
         "en": int((new["lang"] == "en").sum()),
@@ -779,13 +817,15 @@ def import_docx(docx_path: Path = config.DOCX_PATH, keep_sent: bool = True) -> d
 
 
 def main() -> None:
-    cli = argparse.ArgumentParser(description="Parse emails.docx into data/queue.csv")
-    cli.add_argument("--docx", type=Path, default=config.DOCX_PATH)
+    cli = argparse.ArgumentParser(description="Parse a campaign's .docx into its queue CSV")
+    cli.add_argument("--campaign", choices=sorted(config.CAMPAIGNS), default=config.DEFAULT_CAMPAIGN)
+    cli.add_argument("--docx", type=Path, default=None, help="override the campaign's document")
     cli.add_argument("--fresh", action="store_true", help="do not keep 'sent' status from the existing queue")
     args = cli.parse_args()
-    summary = import_docx(args.docx, keep_sent=not args.fresh)
+    campaign = config.CAMPAIGNS[args.campaign]
+    summary = import_docx(campaign, keep_sent=not args.fresh, docx_path=args.docx)
     print(
-        f"{summary['total']} letters (UA {summary['ua']}, EN {summary['en']}) -> {config.QUEUE_CSV}\n"
+        f"{summary['total']} letters (UA {summary['ua']}, EN {summary['en']}) -> {campaign.queue_csv}\n"
         f"pending: {summary['pending']}, missing e-mail: {summary['missing_email']}, "
         f"kept as sent: {summary['kept_sent']}"
     )

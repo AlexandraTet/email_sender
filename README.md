@@ -17,10 +17,25 @@ streamlit run app.py
 Fill in `.env` before starting (see [App passwords](#app-passwords)). The dashboard opens at
 http://localhost:8501. Tested with Python 3.14, Streamlit 1.64 and pandas 3.0.
 
+## Campaigns
+
+Two mailings, each with its own document, queue file and statuses. Pick one at the top of the
+sidebar; everything below (queue, letter editor, dry run, schedule, Start) applies to it.
+
+| Campaign | Document | Queue | Attachment |
+|---|---|---|---|
+| Sponsors | `emails.docx` | `data/queue.csv` | `expense_estimate_ua.pdf` / `expense_estimate_en.pdf` by language |
+| Bloggers / creators | `blogers_emails.docx` | `data/bloggers_queue.csv` | `expense_estimate_en.pdf` (the English price list) |
+
+Only one campaign sends at a time: while one is running, Start is disabled for the other and the
+dashboard says which one is busy. To add a campaign, add an entry to `CAMPAIGNS` in `config.py`.
+From the command line: `python parser.py --campaign bloggers`.
+
 ## Workflow
 
-1. **Import.** On first launch `emails.docx` is parsed into `data/queue.csv`. The current file
-   gives 252 letters (117 UA, 135 EN). 35 letters have no address in the document
+1. **Import.** On first use each campaign's document is parsed into its queue. `emails.docx`
+   gives 252 sponsor letters (117 UA, 135 EN); `blogers_emails.docx` gives 10 creator letters (EN).
+   In the sponsor letters, 35 have no address in the document
    (`E-mail: ____`); they are marked `error`. Fill in the address in the **Queue** or
    **Letter editor** tab and set the status to `pending`.
 2. **Check.** Click **Test SMTP**, then open the **Pre-send check** tab: it lists pending rows
@@ -33,6 +48,13 @@ http://localhost:8501. Tested with Python 3.14, Streamlit 1.64 and pandas 3.0.
    - **Pause** finishes the current e-mail, then waits. While paused you can edit the queue, and edits are used when you **Resume**.
    - **Stop** ends the run.
    - Only `pending` rows are sent.
+   - **Scheduled start** (sidebar, *Enable scheduled start*): choose a time ("Start sending at", e.g. 10:00)
+     or a delay ("Start in N minutes/hours"), then press **Start**. The dashboard counts down until then
+     ("Waiting until 10:00 to start sending… countdown 01h 15m 00s") and then sends as usual. A time
+     that has already passed today means tomorrow. During the countdown you can **Pause**, **Stop**
+     (cancels) or **Start now**; if the time passes while paused, sending starts when you resume.
+     Leave the computer on, plugged in and awake (sleep off) with `streamlit run app.py` running;
+     closing the browser tab is fine.
 5. **Monitor.** The progress bar, counters, countdown to the next e-mail and the activity
    log update every second. The log is also written to `data/activity.log`.
 
@@ -96,5 +118,6 @@ tool does not support. Use Gmail or Ukr.net instead.
 - **Timeout / "Server closed the connection" / TLS error.** The port and security mode don't match. Use 465 with SSL or 587 with STARTTLS; `SMTP_SECURITY=auto` picks the right one for the port.
 - **"Cannot write queue.csv".** The file is open in Excel. Close it.
 - **Closing the terminal (Ctrl+C) stops sending.** Rows already sent keep their status; run the app again and press Start to continue.
-- **Run one copy of the app at a time.** Two copies would both send the same queue.
+- **Run one copy of the app at a time.** Two copies would both send the same queue. Several browser tabs of the *same* app are fine.
+- **"Could not load the app's own modules".** The `.py` files changed while the app was running. Press **R** to rerun, or restart `streamlit run app.py`.
 - `.env` changes apply without a restart. Click **Test SMTP** again after editing it.

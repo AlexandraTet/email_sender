@@ -2,8 +2,7 @@
 .env
 
 # Runtime data (generated from emails.docx / written while sending)
-data/queue.csv
-data/queue.backup.csv
+data/*.csv
 data/*.tmp
 data/activity.log
 data/emails.backup.docx
